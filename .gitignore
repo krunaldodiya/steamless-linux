@@ -1,0 +1,4 @@
+# Local Steamless output artifacts (e.g. --inplace runs from this folder)
+*.unpacked.exe
+*.payload
+SteamDRMP.dll

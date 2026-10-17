@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+#
+# steamless — Linux wrapper around Steamless.CLI.exe, running it through Wine.
+#
+# Usage:
+#   steamless [wrapper options] [steamless options] <file.exe>
+#
+# When <file.exe> is outside the game folder, the wrapper automates staging:
+#   1. backup:   <file.exe> -> <file.exe>.bak                (once, then reused)
+#   2. stage:    <file.exe> -> <game folder>/<name>          (a copy lands there)
+#   3. unpack:   runs Steamless.CLI.exe on the staged copy
+#   4. install:  on success, <game folder>/<name>.unpacked.exe -> <file.exe>
+#                i.e. the original path ends up with the unpacked, DRM-free
+#                exe, while <file.exe>.bak and the staged copy are kept.
+# If unpacking fails, the original path is left untouched — re-running the
+# same command is always safe and never overwrites an existing different
+# backup or staged file.
+#
+# Files already inside the game folder, or runs with --inplace, execute
+# directly (output <file>.unpacked.exe lands next to the input).
+# Windows-style paths (C:\... / Z:\...) are passed to Steamless as-is,
+# without staging.
+#
+# Wrapper options (consumed by this script, not passed to Steamless):
+#   --inplace     Never stage: run directly on the given file.
+#   --deploy      Install the unpacked file back at the original path (default).
+#   --no-deploy   Keep the unpacked file in the game folder instead.
+#   -h, --help    Show the Steamless usage text.
+#
+# Steamless options (passed through):
+#   --quiet --keepbind --keepstub --dumppayload --dumpdrmp
+#   --realign --recalcchecksum --exp
+#
+# Environment:
+#   STEAMLESS_HOME      Steamless install directory (default: this script's dir).
+#   STEAMLESS_GAME_DIR  Staging folder (default: <install>/game).
+#   STEAMLESS_DEPLOY    Set to 0 to default to --no-deploy.
+#   WINEPREFIX          Wine prefix to use (default: ~/.wine).
+#   WINEDEBUG           Wine debug channels (default: -all, quiet).
+#
+set -euo pipefail
+
+die()  { printf 'steamless: %s\n' "$*" >&2; exit 1; }
+note() { printf 'steamless: %s\n' "$*" >&2; }
+
+# Resolve this script's real location (works when symlinked into PATH).
+self="$(readlink -f -- "${BASH_SOURCE[0]}")"
+steamless_dir="${STEAMLESS_HOME:-$(dirname -- "$self")}"
+app="$steamless_dir/Steamless.CLI.exe"
+api="$steamless_dir/Steamless.API.dll"
+game_dir="${STEAMLESS_GAME_DIR:-$steamless_dir/game}"
+
+command -v wine >/dev/null 2>&1 || die "wine not found in PATH; install wine first."
+[[ -f "$app" ]] || die "Steamless.CLI.exe not found in '$steamless_dir' (set STEAMLESS_HOME to the Steamless folder)."
+
+# Wine's Mono resolves Steamless.API too eagerly for the app's Plugins/
+# assembly loader, so a copy next to the exe is required. Create it once.
+if [[ ! -f "$api" && -f "$steamless_dir/Plugins/Steamless.API.dll" ]]; then
+    cp -- "$steamless_dir/Plugins/Steamless.API.dll" "$api"
+fi
+[[ -f "$api" ]] || die "Steamless.API.dll is missing from '$steamless_dir' and its Plugins/ folder."
+
+# Keep wine quiet unless the caller asked for debug output.
+export WINEDEBUG="${WINEDEBUG:--all}"
+
+# Bare `steamless -h` / `steamless --help`: show the app's own usage text.
+if [[ $# -eq 1 && ( "$1" == "-h" || "$1" == "--help" ) ]]; then
+    exec wine "$app"
+fi
+
+# Deploy default: on, unless STEAMLESS_DEPLOY says otherwise.
+deploy=1
+case "${STEAMLESS_DEPLOY:-1}" in 0|no|false) deploy=0 ;; esac
+inplace=0
+
+# Split arguments: wrapper flags are consumed here, Steamless options pass
+# through, and Linux file paths are converted to Windows paths.
+args=()
+input=""
+for arg in "$@"; do
+    case "$arg" in
+        --inplace)   inplace=1 ;;
+        --deploy)    deploy=1 ;;
+        --no-deploy) deploy=0 ;;
+        --* | [A-Za-z]:[\\/]* | \\\\*)
+            args+=("$arg") ;;
+        *)
+            [[ -e "$arg" ]] || die "no such file: $arg"
+            wpath="$(winepath -w "$(readlink -f -- "$arg")" 2>/dev/null)" || true
+            [[ -n "$wpath" ]] || die "failed to convert path to Windows form: $arg"
+            args+=("$wpath")
+            input="$arg" ;;
+    esac
+done
+
+wine_app() { wine "$app" ${args[@]+"${args[@]}"}; }
+
+# Run on the given file as-is and report a produced unpacked file.
+run_direct() {
+    local code=0
+    wine_app || code=$?
+    if [[ $code -eq 0 && -n "$input" && -f "$input.unpacked.exe" ]]; then
+        note "unpacked file written to $(readlink -f -- "$input").unpacked.exe"
+    fi
+    exit "$code"
+}
+
+# No file given: let Steamless print its usage.
+[[ -n "$input" ]] || run_direct
+
+pl="$(readlink -f -- "$input")"
+
+# Direct mode: --inplace, or the file is already inside the game folder.
+if [[ $inplace -eq 1 ]]; then
+    run_direct
+fi
+mkdir -p -- "$game_dir"
+game_dir="$(readlink -f -- "$game_dir")"
+if [[ "$pl" == "$game_dir"/* ]]; then
+    run_direct
+fi
+
+# --- staging workflow -------------------------------------------------------
+name="$(basename -- "$pl")"
+staged="$game_dir/$name"
+bak="$pl.bak"
+
+[[ -f "$pl" ]] || die "not a regular file: $pl"
+
+if [[ -e "$bak" ]] && ! cmp -s -- "$pl" "$bak"; then
+    die "backup exists and differs from the given file: $bak (restore from it or remove it first; refusing to overwrite)"
+fi
+if [[ -e "$staged" ]] && ! cmp -s -- "$pl" "$staged"; then
+    die "a different file is already staged at: $staged (move or delete it first; refusing to overwrite)"
+fi
+
+if [[ ! -e "$bak" ]]; then
+    cp -p -- "$pl" "$bak"
+    note "backup created: $bak"
+fi
+if [[ ! -e "$staged" ]]; then
+    cp -p -- "$pl" "$staged"
+    note "staged to game folder: $staged"
+fi
+
+# Point Steamless at the staged copy instead of the original.
+wpath="$(winepath -w "$staged" 2>/dev/null)" || true
+[[ -n "$wpath" ]] || die "failed to convert staged path to Windows form: $staged"
+args+=("$wpath")
+input="$staged"
+
+code=0
+wine_app || code=$?
+
+unpacked="$staged.unpacked.exe"
+if [[ $code -eq 0 && -f "$unpacked" ]]; then
+    if [[ $deploy -eq 1 ]]; then
+        if mv -f -- "$unpacked" "$pl"; then
+            note "unpacked OK — installed: $pl"
+            note "original backup kept: $bak"
+            note "staged copy kept   : $staged (still packed)"
+            exit 0
+        else
+            note "unpacked OK, but installing it at the original path failed"
+            note "unpacked file: $unpacked"
+            note "backup       : $bak"
+            exit 1
+        fi
+    else
+        note "unpacked OK — output left in game folder: $unpacked"
+        note "original untouched: $pl"
+        note "backup            : $bak"
+        exit 0
+    fi
+fi
+
+# Failure: the original was never modified, so nothing needs restoring.
+if [[ $code -eq 0 ]]; then
+    note "Steamless exited successfully but produced no unpacked file"
+    code=1
+else
+    note "unpack failed (exit $code)"
+fi
+note "original untouched: $pl"
+note "backup            : $bak"
+note "staged            : $staged (re-running the same command is safe)"
+exit "$code"

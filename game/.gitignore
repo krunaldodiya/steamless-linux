@@ -1,0 +1,3 @@
+# Ignore staged game files — keep this folder itself in the repo.
+*
+!.gitignore
